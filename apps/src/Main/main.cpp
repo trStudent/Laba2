@@ -11,7 +11,7 @@ int* arr;
 DWORD WINAPI min_max(LPVOID lpParameters)
 {
     int i = 0;
-    while(i < n - 1)
+    while(i < n - 2)
     {
         Sleep(7);
         int a = arr[i];
@@ -66,6 +66,8 @@ DWORD WINAPI average(LPVOID lpParameters)
 
 int _tmain(int argc, _TCHAR* argv[])
 {
+    setlocale(LC_ALL, "Russian");
+
     std::wcout << L"Введите размер массива: " << std::endl;
     std::wcin >> n;
     while(n < 1)
