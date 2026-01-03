@@ -1,3 +1,10 @@
+/**
+ * @file Process.cpp
+ * @brief Implementation of the Process RAII wrapper class.
+ * @author Timofei Romanchuck
+ * @date 2026-01-03
+ */
+
 #include <core/General/Process.h>
 #include <locale>
 #include <codecvt>
@@ -6,21 +13,23 @@ static std::wstring utf8_to_wstring(const std::string& str) noexcept {
     if (str.empty()) 
         return std::wstring();
 
+    // 1. Determine required wide-character buffer size
     int size_needed = MultiByteToWideChar(CP_UTF8, 0, str.c_str(), -1, NULL, 0);
         
-    if (size_needed <= 0) 
+    if (0 >= size_needed) 
         return std::wstring();
 
     std::wstring result(size_needed, 0);
 
+    // 2. Map UTF-8 to UTF-16
     MultiByteToWideChar(CP_UTF8, 0, str.c_str(), -1, &result[0], size_needed);
         
-    if (result.back() == L'\0')
+    // 3. Remove trailing null if MultiByteToWideChar included it
+    if (L'\0' == result.back())
         result.pop_back();
         
     return result;
 }
-
 
 namespace core::General {
 
@@ -30,16 +39,17 @@ namespace core::General {
 
     void Process::initialize_() noexcept
     {
-        if(hProcess_ != nullptr && hThread_ != nullptr)
+        if(nullptr != hProcess_ && nullptr != hThread_)
         {
+            // Sync IDs from OS in case they weren't provided in the constructor
             pid_ = GetProcessId(hProcess_);
-            if(pid_ == 0)
+            if(INVALID_ID == pid_)
             {
                 reset();
                 return;
             }
             tid_ = GetThreadId(hThread_);
-            if(tid_ == 0)
+            if(INVALID_ID == tid_)
             {
                 reset();
                 return;
@@ -50,6 +60,7 @@ namespace core::General {
 
     void Process::set_zero_() noexcept
     {
+        // Nullify state without triggering CloseHandle (used during moves/release)
         hProcess_ = nullptr;
         hThread_ = nullptr;
         pid_ = 0;
@@ -73,6 +84,7 @@ namespace core::General {
 
     Process::Process(Process&& other_) noexcept
     {
+        // Transfer ownership and stop the source from closing the handles
         this->hProcess_ = other_.hProcess_;
         this->hThread_ = other_.hThread_;
         this->pid_ = other_.pid_;
@@ -82,9 +94,9 @@ namespace core::General {
 
     Process& Process::operator=(Process&& other_) noexcept
     {
-        if(this != &other_)
+        if(&other_ != this)
         {
-            reset();
+            reset(); // Clean up current resources first
             this->hProcess_ = other_.hProcess_;
             this->hThread_ = other_.hThread_;
             this->pid_ = other_.pid_;
@@ -111,22 +123,26 @@ namespace core::General {
 
     HANDLE Process::handle() const noexcept
     { return hProcess_; }
+
     HANDLE Process::thread_handle() const noexcept
     { return hThread_; }
+
     DWORD Process::pid() const noexcept
     { return pid_; }
+
     DWORD Process::tid() const noexcept
     { return tid_; }
 
     std::pair<HANDLE, HANDLE> Process::release() noexcept
     {
         std::pair<HANDLE, HANDLE> result = {hProcess_, hThread_};
-        set_zero_();
+        set_zero_(); // Abandon handles to caller
         return result;
     }
 
     void Process::reset() noexcept
     {
+        // Thread handle is closed before process handle (reverse order of allocation)
         close_handle_(hThread_);
         close_handle_(hProcess_);
         set_zero_();
@@ -165,8 +181,9 @@ namespace core::General {
     wait_status Process::wait_for(milliseconds timeout) noexcept {
         if (valid()) {
             DWORD ms = static_cast<DWORD>(timeout.count());
-            if(ms > INFINITE - 1)
-                ms = INFINITE - 1;
+            // Clamp value to avoid collision with INFINITE (0xFFFFFFFF) bitmask
+            if(MAX_WAIT_TIMEOUT < ms)
+                ms = MAX_WAIT_TIMEOUT;
             DWORD result = WaitForSingleObject(hProcess_, ms);
             return static_cast<wait_status>(result);
         } else 
@@ -177,7 +194,8 @@ namespace core::General {
     {
         if(valid()) {
             DWORD exitCode;
-            if(GetExitCodeProcess(hProcess_, &exitCode) && exitCode != STILL_ACTIVE)
+            // 259 (STILL_ACTIVE) is a special OS status indicating work in progress
+            if(GetExitCodeProcess(hProcess_, &exitCode) && STILL_ACTIVE != exitCode)
                 return exitCode;
             else return std::nullopt;
         } else return std::nullopt;
@@ -209,18 +227,18 @@ namespace core::General {
         else return 0;
     }
 
-    bool Process::suspend() noexcept
-    {
-        if(valid())
-            return SuspendThread(hThread_) != (DWORD)-1;
-        else return false;
+    bool Process::suspend() noexcept {
+        if (valid()) {
+            return THREAD_ERROR_STATUS != SuspendThread(hThread_);
+        }
+        return false;
     }
 
-    bool Process::resume() noexcept
-    {
-        if(valid())
-            return ResumeThread(hThread_) != (DWORD)-1;
-        else return false;
+    bool Process::resume() noexcept {
+        if (valid()) {
+            return THREAD_ERROR_STATUS != ResumeThread(hThread_);
+        }
+        return false;
     }
 
     Process Process::create(const wchar_t* an,
@@ -250,8 +268,10 @@ namespace core::General {
                                 STARTUPINFOW si) noexcept
     {
         PROCESS_INFORMATION pi;
+        // Map empty strings to nullptr as WinAPI expects null for optional paths
         const wchar_t* cs = (cd.empty() ? nullptr : cd.c_str());
         const wchar_t* as = (an.empty() ? nullptr : an.c_str());
+        // cl buffer must be writable; passing nullptr if empty
         wchar_t* ps = (cl.empty() ? nullptr : &cl[0]);
         if(CreateProcessW(as, ps, (LPSECURITY_ATTRIBUTES)pa, (LPSECURITY_ATTRIBUTES)ta, ih, cf, e, cs, (LPSTARTUPINFOW)&si, &pi))
             return Process(pi);
@@ -268,6 +288,7 @@ namespace core::General {
                             const std::string current_directory,
                             STARTUPINFOW si) noexcept
     {
+        // Bridge UTF-8 strings to the native wide-character factory
         std::wstring an = utf8_to_wstring(application_name);
         std::wstring cl = utf8_to_wstring(command_line);
         std::wstring cd = utf8_to_wstring(current_directory);
@@ -283,7 +304,8 @@ namespace core::General {
 
     bool Process::is_valid_handle(HANDLE h) noexcept 
     { 
-        return h != nullptr && h != INVALID_HANDLE_VALUE; 
+        // WinAPI is inconsistent: some calls return NULL, others return -1 on error
+        return nullptr != h && INVALID_HANDLE_VALUE != h; 
     }
 
     void swap(Process& a, Process& b) noexcept

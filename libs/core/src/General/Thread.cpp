@@ -1,3 +1,10 @@
+/**
+ * @file Thread.cpp
+ * @brief Implementation of the Thread RAII wrapper class.
+ * @author Timofei Romanchuck
+ * @date 2026-01-03
+ */
+
 #include <core/General/Thread.h>
 
 namespace core::General {
@@ -5,12 +12,14 @@ namespace core::General {
     void Thread::set_zero_() noexcept
     {
         hThread_ = nullptr;
-        tid_ = 0;
+        tid_ = INVALID_ID;
     }
 
     bool Thread::is_valid_handle(HANDLE h) noexcept
     {
-        return h != nullptr && h != INVALID_HANDLE_VALUE;
+        // Windows API is inconsistent: some functions return NULL on failure,
+        // while others return INVALID_HANDLE_VALUE (-1). We check for both.
+        return nullptr != h && INVALID_HANDLE_VALUE != h;
     }
 
     void Thread::close_handle_(HANDLE h) noexcept
@@ -25,10 +34,13 @@ namespace core::General {
     {
         if (is_valid_handle(hThread_))
         {
-            if (tid_ == 0)
+            // Ensure the thread ID is synchronized with the handle. 
+            // Useful if the handle was obtained via OpenThread without an explicit ID.
+            if (INVALID_ID == tid_)
                 tid_ = GetThreadId(hThread_);
 
-            if (tid_ == 0)
+            // If GetThreadId fails, the handle is likely invalid or lacks permissions.
+            if (INVALID_ID == tid_)
                 reset();
         }
         else
@@ -36,23 +48,26 @@ namespace core::General {
     }
 
     Thread::Thread() noexcept
-        : hThread_(nullptr), tid_(0) { }
+        : hThread_(nullptr), tid_(INVALID_ID) { }
 
     Thread::~Thread()
     {
+        // RAII: Ensure the handle is closed when the wrapper goes out of scope.
         reset();
     }
 
-    Thread::Thread(Thread&& _other) noexcept
-        : hThread_(_other.hThread_), tid_(_other.tid_)
+    Thread::Thread(Thread&& other) noexcept
+        : hThread_(other.hThread_), tid_(other.tid_)
     {
-        _other.set_zero_();
+        // Ownership transfer: source must be nullified to prevent double-closing.
+        other.set_zero_();
     }
 
     Thread& Thread::operator=(Thread&& other) noexcept
     {
-        if (this != &other)
+        if (&other != this)
         {
+            // Close existing resource before taking over the new one.
             reset();
             hThread_ = other.hThread_;
             tid_ = other.tid_;
@@ -96,6 +111,7 @@ namespace core::General {
     HANDLE Thread::release() noexcept
     {
         HANDLE temp = hThread_;
+        // Clear state without closing the handle, effectively giving it to the caller.
         set_zero_();
         return temp;
     }
@@ -114,29 +130,33 @@ namespace core::General {
         initialize_();
     }
 
-    void Thread::swap(Thread& other_) noexcept
+    void Thread::swap(Thread& other) noexcept
     {
         HANDLE tempH = hThread_;
         DWORD tempTid = tid_;
 
-        hThread_ = other_.hThread_;
-        tid_ = other_.tid_;
+        hThread_ = other.hThread_;
+        tid_ = other.tid_;
 
-        other_.hThread_ = tempH;
-        other_.tid_ = tempTid;
+        other.hThread_ = tempH;
+        other.tid_ = tempTid;
     }
 
     void Thread::join() noexcept
     {
         if (valid())
         {
+            // Block the caller until the kernel object (thread) becomes signaled.
             WaitForSingleObject(hThread_, INFINITE);
+            // Post-condition: clean up the handle since the thread has terminated.
             reset();
         }
     }
 
     void Thread::detach() noexcept
     {
+        // Simply close the handle reference. The OS keeps the thread alive 
+        // until it finishes, but we can no longer control it.
         reset();
     }
 
@@ -148,7 +168,9 @@ namespace core::General {
         DWORD exitCode = 0;
         if (GetExitCodeThread(hThread_, &exitCode))
         {
-            if (exitCode == STILL_ACTIVE)
+            // Windows uses 259 (STILL_ACTIVE) as a special status.
+            // If the thread actually returns 259, it is indistinguishable from 'running'.
+            if (STILL_ACTIVE == exitCode)
                 return std::nullopt;
             return exitCode;
         }
@@ -161,28 +183,32 @@ namespace core::General {
 
         DWORD exitCode = 0;
         if (GetExitCodeThread(hThread_, &exitCode))
-            return (exitCode == STILL_ACTIVE);
+            return (STILL_ACTIVE == exitCode);
         return false;
     }
 
     bool Thread::terminate(UINT exit_code) noexcept
     {
         if (valid())
-            return TerminateThread(hThread_, exit_code) != 0;
+            // Warning: TerminateThread is dangerous as it does not clean up 
+            // thread stacks or release locks held by the thread.
+            return 0 != TerminateThread(hThread_, exit_code);
         return false;
     }
 
     bool Thread::suspend() noexcept
     {
         if (valid())
-            return SuspendThread(hThread_) != (DWORD)-1;
+            // SuspendThread increments the suspend count.
+            return ERROR_STATUS != SuspendThread(hThread_);
         return false;
     }
 
     bool Thread::resume() noexcept
     {
         if (valid())
-            return ResumeThread(hThread_) != (DWORD)-1;
+            // ResumeThread decrements the suspend count; thread runs if count reaches 0.
+            return ERROR_STATUS != ResumeThread(hThread_);
         return false;
     }
 
@@ -201,7 +227,9 @@ namespace core::General {
         if (valid())
         {
             auto ms_count = timeout.count();
-            DWORD ms = (ms_count >= INFINITE) ? (INFINITE - 1) : static_cast<DWORD>(ms_count);
+            // Clamping the value to MAX_WAIT_TIMEOUT prevents a high value from 
+            // being interpreted as INFINITE (0xFFFFFFFF) by the kernel.
+            DWORD ms = (MAX_WAIT_TIMEOUT < ms_count) ? (MAX_WAIT_TIMEOUT) : static_cast<DWORD>(ms_count);
 
             DWORD result = WaitForSingleObject(hThread_, ms);
             return static_cast<wait_status>(result);
@@ -212,7 +240,8 @@ namespace core::General {
     bool Thread::set_priority(DWORD priority) noexcept
     {
         if (valid())
-            return SetThreadPriority(hThread_, static_cast<int>(priority)) != 0;
+            // Priority is relative to the process priority class.
+            return 0 != SetThreadPriority(hThread_, static_cast<int>(priority));
         return false;
     }
 
@@ -221,15 +250,16 @@ namespace core::General {
         if (valid())
         {
             int p = GetThreadPriority(hThread_);
-            if (p != THREAD_PRIORITY_ERROR_RETURN)
+            if (THREAD_PRIORITY_ERROR_RETURN != p)
                 return static_cast<DWORD>(p);
         }
-        return 0;
+        return ERROR_PRIORITY;
     }
 
     DWORD_PTR Thread::set_affinity(DWORD_PTR mask) noexcept
     {
         if (valid())
+            // Restricts the thread to run on specific logical processors defined by the bitmask.
             return SetThreadAffinityMask(hThread_, mask);
         return 0;
     }
@@ -242,7 +272,8 @@ namespace core::General {
         DWORD dwCreationFlags,
         LPDWORD lpThreadId) noexcept
     {
-        DWORD tid = 0;
+        DWORD tid = INVALID_ID;
+        // Use the native Win32 function to spawn a kernel-level thread.
         HANDLE h = CreateThread(
             lpThreadAttributes,
             dwStackSize,
@@ -255,8 +286,10 @@ namespace core::General {
         if (h)
         {
             Thread t;
-            if (lpThreadId)
+            // Optionally return the ID to the caller if a pointer was provided.
+            if (nullptr != lpThreadId)
                 *lpThreadId = tid;
+            // Transfer ownership to the RAII wrapper.
             t.reset(h, tid);
             return t;
         }
