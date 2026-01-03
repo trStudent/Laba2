@@ -11,18 +11,10 @@
 #include <chrono>
 #include <windows.h>
 #include <optional>
+#include "Type.h"
 
 namespace core::General
 {
-    typedef std::chrono::milliseconds milliseconds;
-
-    enum class wait_status : DWORD {
-        signaled    = WAIT_OBJECT_0,
-        timeout     = WAIT_TIMEOUT,
-        failed      = WAIT_FAILED,
-        abandoned   = WAIT_ABANDONED
-    };
-
     class Thread
     {
         private:

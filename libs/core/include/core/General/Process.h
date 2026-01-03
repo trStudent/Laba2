@@ -13,7 +13,7 @@
 #include <optional>
 #include <string>
 #include <utility>
-#include "Thread.h"
+#include "Type.h"
 
 namespace core::General
 {
